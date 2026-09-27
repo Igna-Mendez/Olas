@@ -85,9 +85,6 @@ public:
         if (closed_) return false;
         if (queue_.size() >= max_chunks_) {
             queue_.pop_front();
-            overflow_warned_ = true;
-        } else {
-            overflow_warned_ = false;
         }
         queue_.push_back(std::move(chunk));
         cv_.notify_one();
@@ -115,7 +112,6 @@ private:
     std::deque<std::vector<int16_t>> queue_;
     size_t max_chunks_;
     bool closed_ = false;
-    bool overflow_warned_ = false;
 };
 
 // ---------- StatefulVad ----------
@@ -657,6 +653,11 @@ void Engine::stop() {
     }
     for (auto &s : impl_->slots) {
         if (s->thread.joinable()) s->thread.join();
+    }
+    // Consumer threads have exited. Now it is single-threaded, so it is safe
+    // to flush each slot's in-progress VAD segment without racing a feeder.
+    for (auto &s : impl_->slots) {
+        try { s->flush(); } catch (...) {}
     }
     impl_->slots.clear();
 }

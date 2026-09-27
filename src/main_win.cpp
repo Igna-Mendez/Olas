@@ -58,7 +58,14 @@ struct CaptureArgs {
 static void capture_loop(CaptureArgs *a) {
     std::vector<int16_t> pcm((size_t)a->chunk_samples);
     while (g_running.load()) {
-        if (!capture_read_chunk(pcm.data())) break;
+        if (!capture_read_chunk(pcm.data())) {
+            // capture_read_chunk() returns 0 whenever capture is transiently
+            // stopped (e.g. device switch).  Only exit if we're actually
+            // shutting down.
+            if (!g_running.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
         a->engine->feed(pcm);
     }
 }
@@ -275,12 +282,12 @@ int main() {
     win32_ui_run(on_toggle, on_device);
 
     // Shutdown.
+    // Shutdown.
     g_running.store(false);
     capture_stop();
     if (cap_thread.joinable()) cap_thread.join();
 
-    engine.stop();
-    engine.flush();
+    engine.stop();          // stop() now flushes in-progress segments itself.
     g_engine = nullptr;
 
     win32_ui_shutdown();

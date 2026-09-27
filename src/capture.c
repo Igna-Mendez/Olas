@@ -3,16 +3,22 @@
  *
  * Loopback in miniaudio 0.11: ma_device_type_loopback opens the *render*
  * endpoint of a playback device with AUDCLNT_STREAMFLAGS_LOOPBACK and
- * delivers its rendered audio. We set config.sampleRate to 16000 and
- * capture.channels to 1 so miniaudio's built-in resampler (native rate ->
- * 16 kHz, linear) and channel mixer (stereo -> mono) do the work in the
- * backend thread; the data callback then only copies s16 frames into the
- * ring. No hand-rolled resampler, no PortAudio.
+ * delivers its rendered audio.  We set config.sampleRate to 16000 and
+ * capture.channels to 1 so miniaudio's built-in resampler + channel mixer
+ * do the work in the backend thread; the data callback only copies s16
+ * frames into the ring.
+ *
+ * Ring indices are _Atomic with acquire/release on the write side so the
+ * data writes performed by the WASAPI callback are guaranteed visible to
+ * the consumer before it observes the advanced write pointer.  The ring
+ * length is a power of two so both sides can mask instead of taking a
+ * per-sample integer modulo on the realtime thread.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,37 +32,34 @@
 
 #define MAX_DEVICES 64
 
-/* ring sized for 2 * max chunk: the writer can be one full chunk ahead of
- * the reader without overwriting unread frames */
-#define RING_FRAMES (SAMPLE_RATE * MAX_CHUNK_SEC * 2)
+/* Ring: enough headroom for one full chunk of writer lead.  Power of two so
+ * the hot paths can use a mask.  1<<19 = 524288 frames = 32.768 s @ 16 kHz. */
+#define RING_FRAMES ((ma_uint64)1u << 19)
+#define RING_MASK   (RING_FRAMES - 1u)
 
 static ma_context  g_ctx;
 static ma_device   g_dev;
-static int         g_chunk_samples = 0;   /* set by the app before capture_start */
+static int         g_chunk_samples = 0;
 
 static ma_device_id  g_devices[MAX_DEVICES];
 static char          g_dev_names[MAX_DEVICES][MA_MAX_DEVICE_NAME_LENGTH + 1];
 static ma_bool32     g_dev_is_default[MAX_DEVICES];
 static int           g_n_devices = 0;
 
-static int16_t   g_ring[RING_FRAMES];
-static volatile ma_uint64 g_ring_read  = 0;  /* advanced by capture_read_chunk (UI thread) */
-static ma_uint64 g_ring_written = 0;         /* advanced by the miniaudio callback   */
+static int16_t             g_ring[RING_FRAMES];
+static _Atomic ma_uint64   g_ring_read    = 0;  /* consumer-owned  */
+static _Atomic ma_uint64   g_ring_written = 0;  /* producer-owned  */
 
-static HANDLE g_have_chunk = NULL;   /* auto-reset event: set when a chunk is ready */
+static HANDLE g_have_chunk = NULL;
 static int    g_ctx_ok = 0;
 static int    g_cs_ok = 0;
 static int    g_started = 0;
-static CRITICAL_SECTION g_cs;        /* guards g_started */
+static CRITICAL_SECTION g_cs;
 
 /* ---------- device enumeration ---------- */
 
 struct enum_ctx { int index; };
 
-/*
- * WASAPI enumerates playback AND capture endpoints; loopback opens the
- * *render* endpoint, so we only want playback devices.
- */
 static ma_bool32 ma_enum_devices(ma_context *pContext, ma_device_type deviceType,
                                  const ma_device_info *pDevice, void *pUserData) {
     (void)pContext;
@@ -91,7 +94,7 @@ int capture_init(void) {
     g_cs_ok = 1;
     InitializeCriticalSection(&g_cs);
 
-    g_have_chunk = CreateEventW(NULL, FALSE, FALSE, NULL);  /* auto-reset */
+    g_have_chunk = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!g_have_chunk) {
         fprintf(stderr, "capture: CreateEventW failed\n");
         return 0;
@@ -103,27 +106,28 @@ int capture_init(void) {
 
 /* ---------- capture device ---------- */
 
-/* miniaudio audio callback: copy s16 mono frames into the ring.
- * Skips writing while g_started == 0 (device stopped or not yet started),
- * so a still-callbacking previous device can't write into a ring that
- * capture_start is about to reset. */
 static void ma_data_callback(ma_device *pDevice, void *pOut,
-                                        const void *pIn, ma_uint32 frameCount) {
+                             const void *pIn, ma_uint32 frameCount) {
     (void)pDevice; (void)pOut;
     if (!g_started) return;
-    const int16_t *in = (const int16_t *)pIn;
-    for (ma_uint32 i = 0; i < frameCount; i++) {
-        ma_uint64 pos = (g_ring_written + i) % RING_FRAMES;
-        g_ring[pos] = in[i];
-    }
-    g_ring_written += frameCount;
 
-    if (g_ring_written - g_ring_read >= (ma_uint64)g_chunk_samples)
+    const int16_t *in = (const int16_t *)pIn;
+    ma_uint64 w = atomic_load_explicit(&g_ring_written, memory_order_relaxed);
+
+    for (ma_uint32 i = 0; i < frameCount; i++)
+        g_ring[(w + i) & RING_MASK] = in[i];
+
+    w += frameCount;
+    /* Release: sample writes must be visible before the new write pointer. */
+    atomic_store_explicit(&g_ring_written, w, memory_order_release);
+
+    const ma_uint64 r = atomic_load_explicit(&g_ring_read, memory_order_relaxed);
+    if (w - r >= (ma_uint64)g_chunk_samples)
         SetEvent(g_have_chunk);
 }
 
 int capture_start(int device_index) {
-    if (g_chunk_samples <= 0 || g_chunk_samples > RING_FRAMES) {
+    if (g_chunk_samples <= 0 || (ma_uint64)g_chunk_samples > RING_FRAMES) {
         fprintf(stderr, "capture: chunk_samples out of range (%d)\n", g_chunk_samples);
         return 0;
     }
@@ -146,17 +150,12 @@ int capture_start(int device_index) {
         return 0;
     }
 
-    /* drop whatever was in the ring before start; both pointers stay in sync.
-     * Safe without a device uninit here: capture_start is only called after
-     * a previous capture_stop fully joined the old callback thread. */
     ResetEvent(g_have_chunk);
     EnterCriticalSection(&g_cs);
-    g_ring_read = g_ring_written = 0;
+    atomic_store_explicit(&g_ring_read,    0, memory_order_relaxed);
+    atomic_store_explicit(&g_ring_written, 0, memory_order_relaxed);
     g_started = 1;
     LeaveCriticalSection(&g_cs);
-    /* note: the pump thread polls capture_is_started() on its ~200 ms
-     * timeout, so the newest chunk is picked up within that window after a
-     * start; audio keeps accumulating in the ring meanwhile. */
     return 1;
 }
 
@@ -167,12 +166,8 @@ void capture_stop(void) {
     if (was_started) g_started = 0;
     LeaveCriticalSection(&g_cs);
     if (was_started) {
-        /* uninit (which joins the miniaudio backend/callback thread) OUTSIDE
-         * g_cs: a reader in capture_read_chunk() may hold/need g_cs, and the
-         * callback may run one last frame between device_stop and uninit */
         ma_device_stop(&g_dev);
         ma_device_uninit(&g_dev);
-        /* wake any reader blocked in capture_read_chunk() */
         SetEvent(g_have_chunk);
     }
 }
@@ -199,8 +194,7 @@ int  capture_is_started(void) {
     return started;
 }
 
-int  capture_read_chunk(int16_t *out) {
-    /* block until a full chunk has been written, or capture stops */
+int capture_read_chunk(int16_t *out) {
     for (;;) {
         if (WaitForSingleObject(g_have_chunk, 50) != WAIT_OBJECT_0) {
             EnterCriticalSection(&g_cs);
@@ -209,8 +203,10 @@ int  capture_read_chunk(int16_t *out) {
             if (!started) return 0;
             continue;
         }
-        ma_uint64 avail = g_ring_written - g_ring_read;
-        if (avail >= (ma_uint64)g_chunk_samples)
+        /* Acquire: pairs with the producer's release store above. */
+        const ma_uint64 w = atomic_load_explicit(&g_ring_written, memory_order_acquire);
+        const ma_uint64 r = atomic_load_explicit(&g_ring_read,    memory_order_relaxed);
+        if (w - r >= (ma_uint64)g_chunk_samples)
             break;
         EnterCriticalSection(&g_cs);
         int started = g_started;
@@ -218,11 +214,11 @@ int  capture_read_chunk(int16_t *out) {
         if (!started) return 0;
     }
 
-    for (int i = 0; i < g_chunk_samples; i++) {
-        ma_uint64 pos = (g_ring_read + i) % RING_FRAMES;
-        out[i] = g_ring[pos];
-    }
-    g_ring_read += (ma_uint64)g_chunk_samples;
+    const ma_uint64 r = atomic_load_explicit(&g_ring_read, memory_order_relaxed);
+    for (int i = 0; i < g_chunk_samples; i++)
+        out[i] = g_ring[(r + i) & RING_MASK];
+    atomic_store_explicit(&g_ring_read, r + (ma_uint64)g_chunk_samples,
+                          memory_order_release);
     return 1;
 }
 

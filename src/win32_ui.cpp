@@ -60,6 +60,14 @@ enum {
 
 // ---------------- state ----------------
 
+// One committed line of transcript kept in memory so that font/stamp toggles
+// can replay the visible scrollback instead of wiping the pane.
+struct LogLine {
+    std::string prefix;
+    std::string body;
+    bool        is_error = false;
+};
+
 struct Pane {
     int slot = -1;
     bool enabled = true;
@@ -75,6 +83,7 @@ struct Pane {
 
     LONG partial_start = 0;       // RichEdit char position of partial start
     std::string last_partial;     // dedupe
+    std::vector<LogLine> log;     // finalized lines (errors included)
 };
 
 struct Update {
@@ -96,11 +105,18 @@ static HBRUSH      g_bk_brush      = nullptr;
 static std::vector<std::unique_ptr<Pane>> g_panes;
 static int         g_body_pt       = 14;   // base body font size (points)
 static bool        g_show_stamps   = true;
+static UINT        g_dpi           = 96;
 
 static olas_toggle_fn g_on_toggle  = nullptr;
 static olas_device_fn g_on_device  = nullptr;
 
+// Forward decls (used by pane_proc).
+static void pane_detach(Pane *p);
+static void pane_reattach(Pane *p);
+
 // ---------------- helpers ----------------
+
+static inline int D(int px) { return MulDiv(px, (int)g_dpi, 96); }
 
 static wchar_t *a2w(const char *s) {
     if (!s) return nullptr;
@@ -118,11 +134,8 @@ static void set_status_w(const wchar_t *w) {
 
 // ---------------- RichEdit tagged insertion ----------------
 
-// Insert `text` at the end of the edit with the given character format.
-// is_stamp -> grey + smaller; is_error -> grey; is_hidden -> CFE_HIDDEN.
 static void re_insert(HWND edit, const wchar_t *text, bool is_stamp,
                       bool is_error, bool is_hidden) {
-    // Move caret to end.
     CHARRANGE cr = { -1, -1 };
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&cr);
 
@@ -146,11 +159,10 @@ static LONG edit_length(HWND edit) {
     GETTEXTLENGTHEX gtl;
     ZeroMemory(&gtl, sizeof gtl);
     gtl.flags = GTL_DEFAULT;
-    gtl.codepage = 1200;   // UTF-16
+    gtl.codepage = 1200;
     return (LONG)SendMessageW(edit, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
 }
 
-// Delete text from `start` to end.
 static void edit_delete_from(HWND edit, LONG start) {
     CHARRANGE cr = { start, -1 };
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&cr);
@@ -167,32 +179,55 @@ static void pane_layout(Pane *p) {
     if (!p->container) return;
     RECT r;
     GetClientRect(p->container, &r);
-    const int pad = 4, hdr = 28;
+    const int pad = D(4), hdr = D(28);
 
-    MoveWindow(p->label, pad, 6, 60, 20, TRUE);
+    MoveWindow(p->label, pad, D(6), D(60), D(20), TRUE);
 
-    int bw = 76, bh = 22;
+    int bw = D(76), bh = D(22);
     int x = r.right - pad - bw;
-    MoveWindow(p->detach_btn, x, 3, bw, bh, TRUE);
-    x -= bw + 4;
-    MoveWindow(p->toggle_btn, x, 3, bw, bh, TRUE);
+    MoveWindow(p->detach_btn, x, D(3), bw, bh, TRUE);
+    x -= bw + D(4);
+    MoveWindow(p->toggle_btn, x, D(3), bw, bh, TRUE);
 
     MoveWindow(p->edit, pad, hdr, r.right - 2 * pad, r.bottom - hdr - pad, TRUE);
 }
 
-// Re-render the entire pane from scratch (used on Stamps toggle).
+// Re-render the entire pane from the in-memory log.  Used on Stamps/zoom
+// toggles so that changing presentation does not erase the scrollback.
 static void pane_rerender(Pane *p) {
     if (!p->edit) return;
+    SendMessageW(p->edit, WM_SETREDRAW, FALSE, 0);
     SetWindowTextW(p->edit, L"");
     p->partial_start = 0;
     p->last_partial.clear();
-    // (No stored log; the working set is small in practice.)
+
+    for (const auto &line : p->log) {
+        if (line.is_error) {
+            std::wstring w = L"[error] ";
+            wchar_t *wb = a2w(line.body.c_str());
+            if (wb) { w += wb; free(wb); }
+            w += L"\n";
+            re_insert(p->edit, w.c_str(), false, true, false);
+        } else {
+            wchar_t *wp = a2w(line.prefix.c_str());
+            wchar_t *wb = a2w(line.body.c_str());
+            if (wp) { re_insert(p->edit, wp, true, false, !g_show_stamps); free(wp); }
+            if (wb) { re_insert(p->edit, wb, false, false, false); free(wb); }
+            re_insert(p->edit, L"\n", false, false, false);
+        }
+    }
+
+    p->partial_start = edit_length(p->edit);
+    SendMessageW(p->edit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(p->edit, nullptr, TRUE);
+    edit_scroll_bottom(p->edit);
 }
 
-// Apply an update to a pane (UI thread).
 static void pane_apply(Pane *p, const Update &u) {
     HWND e = p->edit;
     if (!e) return;
+
+    SendMessageW(e, WM_SETREDRAW, FALSE, 0);
 
     if (u.is_error) {
         edit_delete_from(e, p->partial_start);
@@ -203,13 +238,19 @@ static void pane_apply(Pane *p, const Update &u) {
         line += L"\n";
         re_insert(e, line.c_str(), false, true, false);
         p->partial_start = edit_length(e);
+        p->log.push_back({ "", u.body, true });
         edit_scroll_bottom(e);
+        SendMessageW(e, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(e, nullptr, TRUE);
         return;
     }
 
     std::string cur = u.prefix + u.body;
     if (!u.is_final) {
-        if (cur == p->last_partial) return;
+        if (cur == p->last_partial) {
+            SendMessageW(e, WM_SETREDRAW, TRUE, 0);
+            return;
+        }
         p->last_partial = cur;
     } else {
         p->last_partial.clear();
@@ -232,8 +273,12 @@ static void pane_apply(Pane *p, const Update &u) {
     if (u.is_final) {
         re_insert(e, L"\n", false, false, false);
         p->partial_start = edit_length(e);
+        p->log.push_back({ u.prefix, u.body, false });
         edit_scroll_bottom(e);
     }
+
+    SendMessageW(e, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(e, nullptr, TRUE);
 }
 
 // ---------------- pane window proc ----------------
@@ -252,14 +297,10 @@ static LRESULT CALLBACK pane_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_TOGGLE:
                     if (g_on_toggle) g_on_toggle(p->slot);
                     return 0;
-                case ID_DETACH: {
-                    // Toggle detach
-                    extern void pane_detach(Pane*);
-                    extern void pane_reattach(Pane*);
+                case ID_DETACH:
                     if (p->float_window) pane_reattach(p);
                     else                 pane_detach(p);
                     return 0;
-                }
             }
             break;
         }
@@ -269,19 +310,16 @@ static LRESULT CALLBACK pane_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ---------------- detach / reattach ----------------
 
-static void pane_layout_children(Pane *p) { pane_layout(p); }
-
 void pane_detach(Pane *p) {
     if (p->float_window) return;
 
-    // Remove from main layout (we just hide it) and create a floating frame.
     ShowWindow(p->container, SW_HIDE);
 
     HWND w = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         L"OLASFloat", L"OLAS",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 420,
+        CW_USEDEFAULT, CW_USEDEFAULT, D(640), D(420),
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!w) {
         ShowWindow(p->container, SW_SHOW);
@@ -309,7 +347,7 @@ void pane_detach(Pane *p) {
 
     RECT r; GetClientRect(w, &r);
     MoveWindow(p->container, 0, 0, r.right, r.bottom, TRUE);
-    pane_layout_children(p);
+    pane_layout(p);
 }
 
 void pane_reattach(Pane *p) {
@@ -323,7 +361,6 @@ void pane_reattach(Pane *p) {
 
     SetWindowTextW(p->detach_btn, L"Detach");
 
-    // Force a re-layout of the main window.
     RECT r; GetClientRect(g_main_window, &r);
     SendMessageW(g_main_window, WM_SIZE, 0, MAKELPARAM(r.right, r.bottom));
 }
@@ -352,7 +389,7 @@ static LRESULT CALLBACK float_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void main_layout() {
     RECT r;
     GetClientRect(g_main_window, &r);
-    const int pad = 8, h_row = 28;
+    const int pad = D(8), h_row = D(28);
 
     int status_h = 0;
     if (g_status) {
@@ -362,24 +399,24 @@ static void main_layout() {
 
     // Toolbar
     int x = pad, y = pad;
-    MoveWindow(GetDlgItem(g_main_window, 900), x, y + 4, 46, 20, TRUE); // "Device:"
-    x += 50;
-    MoveWindow(g_device_combo, x, y, 260, 220, TRUE);
-    x += 270;
-    MoveWindow(g_stamps_btn, x, y, 80, h_row, TRUE);
-    x += 90;
-    MoveWindow(GetDlgItem(g_main_window, ID_ZOOM_OUT), x, y, 40, h_row, TRUE);
-    x += 44;
-    MoveWindow(GetDlgItem(g_main_window, ID_ZOOM_IN),  x, y, 40, h_row, TRUE);
+    MoveWindow(GetDlgItem(g_main_window, 900), x, y + D(4), D(46), D(20), TRUE);
+    x += D(50);
+    MoveWindow(g_device_combo, x, y, D(260), D(220), TRUE);
+    x += D(270);
+    MoveWindow(g_stamps_btn, x, y, D(80), h_row, TRUE);
+    x += D(90);
+    MoveWindow(GetDlgItem(g_main_window, ID_ZOOM_OUT), x, y, D(40), h_row, TRUE);
+    x += D(44);
+    MoveWindow(GetDlgItem(g_main_window, ID_ZOOM_IN),  x, y, D(40), h_row, TRUE);
 
     // Panes
     int pane_y = y + h_row + pad;
     int pane_h = r.bottom - pane_y - pad - status_h;
-    if (pane_h < 60) pane_h = 60;
+    if (pane_h < D(60)) pane_h = D(60);
 
     int n = (int)g_panes.size();
     if (n == 0) return;
-    int gap = 4;
+    int gap = D(4);
     int total_w = r.right - 2 * pad - (n - 1) * gap;
     int each    = total_w / n;
     int extra   = total_w - each * n;
@@ -404,6 +441,16 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             main_layout();
             return 0;
 
+        case WM_DPICHANGED: {
+            g_dpi = HIWORD(wp);
+            RECT *r = (RECT *)lp;
+            SetWindowPos(hwnd, nullptr, r->left, r->top,
+                         r->right - r->left, r->bottom - r->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            main_layout();
+            return 0;
+        }
+
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case ID_DEVICE:
@@ -417,10 +464,37 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     for (auto &pp : g_panes) pane_rerender(pp.get());
                     return 0;
                 case ID_ZOOM_IN:
-                    if (g_body_pt < 32) { g_body_pt += 2; for (auto &pp : g_panes) pane_rerender(pp.get()); }
+                    if (g_body_pt < 32) {
+                        g_body_pt += 2;
+                        // Re-apply font to every edit, then replay.
+                        for (auto &pp : g_panes) {
+                            if (g_font_mono) DeleteObject(g_font_mono);
+                            g_font_mono = CreateFontW(
+                                -MulDiv(g_body_pt, (int)g_dpi, 72),
+                                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                FIXED_PITCH | FF_MODERN, L"Consolas");
+                            SendMessageW(pp->edit, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+                            pane_rerender(pp.get());
+                        }
+                    }
                     return 0;
                 case ID_ZOOM_OUT:
-                    if (g_body_pt > 8)  { g_body_pt -= 2; for (auto &pp : g_panes) pane_rerender(pp.get()); }
+                    if (g_body_pt > 8) {
+                        g_body_pt -= 2;
+                        for (auto &pp : g_panes) {
+                            if (g_font_mono) DeleteObject(g_font_mono);
+                            g_font_mono = CreateFontW(
+                                -MulDiv(g_body_pt, (int)g_dpi, 72),
+                                0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                FIXED_PITCH | FF_MODERN, L"Consolas");
+                            SendMessageW(pp->edit, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+                            pane_rerender(pp.get());
+                        }
+                    }
                     return 0;
             }
             return 0;
@@ -443,13 +517,12 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_GETMINMAXINFO: {
             MINMAXINFO *m = (MINMAXINFO *)lp;
-            m->ptMinTrackSize.x = 640;
-            m->ptMinTrackSize.y = 400;
+            m->ptMinTrackSize.x = D(640);
+            m->ptMinTrackSize.y = D(400);
             return 0;
         }
 
         case WM_CLOSE:
-            // Reattach any floating panes first.
             for (auto &pp : g_panes) if (pp->float_window) pane_reattach(pp.get());
             PostQuitMessage(0);
             return 0;
@@ -463,14 +536,21 @@ int win32_ui_init(const std::vector<std::string> &languages) {
     load_richedit();
 
     HINSTANCE hInst = GetModuleHandleW(nullptr);
+
+    // Per-monitor DPI awareness (v2), fall back to legacy system-DPI.
+#if defined(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        SetProcessDPIAware();
+    }
+#else
     SetProcessDPIAware();
+#endif
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof icc;
     icc.dwICC  = ICC_STANDARD_CLASSES | ICC_BAR_CLASSES;
     InitCommonControlsEx(&icc);
 
-    // Register window classes.
     WNDCLASSEXW wc; ZeroMemory(&wc, sizeof wc);
     wc.cbSize        = sizeof wc;
     wc.lpfnWndProc   = main_proc;
@@ -491,21 +571,24 @@ int win32_ui_init(const std::vector<std::string> &languages) {
     wc.lpszClassName = L"OLASFloat";
     if (!RegisterClassExW(&wc)) return 0;
 
+    g_main_window = CreateWindowExW(
+        0, L"OLASMain", L"OLAS — Open Local Audio Scribe (Windows)",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        CW_USEDEFAULT, CW_USEDEFAULT, D(1280), D(720),
+        nullptr, nullptr, hInst, nullptr);
+    if (!g_main_window) return 0;
+
+    g_dpi = GetDpiForWindow(g_main_window);
+    if (g_dpi == 0) g_dpi = 96;
+
     g_font_mono = CreateFontW(
-        -MulDiv(g_body_pt, GetDeviceCaps(GetDC(nullptr), LOGPIXELSY), 72),
+        -MulDiv(g_body_pt, (int)g_dpi, 72),
         0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (!g_font_mono) g_font_mono = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     g_font_ui = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     g_bk_brush = (HBRUSH)(COLOR_WINDOW + 1);
-
-    g_main_window = CreateWindowExW(
-        0, L"OLASMain", L"OLAS — Open Local Audio Scribe (Windows)",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
-        nullptr, nullptr, hInst, nullptr);
-    if (!g_main_window) return 0;
 
     // ---- toolbar controls ----
     HWND lbl = CreateWindowExW(0, L"STATIC", L"Device:",
@@ -575,7 +658,6 @@ int win32_ui_init(const std::vector<std::string> &languages) {
             0, 0, 0, 0, p->container, (HMENU)ID_EDIT, hInst, nullptr);
         SendMessageW(p->edit, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
         SendMessageW(p->edit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_WINDOW));
-        // No wrap: keep mono layout predictable
         SendMessageW(p->edit, EM_SETTARGETDEVICE, 0, 0);
 
         g_panes.push_back(std::move(p));
