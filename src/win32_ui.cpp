@@ -15,10 +15,18 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+
+/* Enable the RichEdit 3.0+ API surface (CHARFORMAT2W, EM_EXSETSEL, etc.)
+ before <richedit.h*> is pulled in. */
+#ifndef _RICHEDIT_VER
+#define _RICHEDIT_VER 0x0500
+#endif
+
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <richedit.h>
 
 #include <cstdio>
 #include <cstring>

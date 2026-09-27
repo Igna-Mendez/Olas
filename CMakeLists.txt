@@ -27,12 +27,29 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/moonshine-ai/moonshine.git
     GIT_TAG main
     GIT_SHALLOW TRUE
+    SOURCE_SUBDIR core
 )
 
 set(MOONSHINE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MOONSHINE_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(moonshine)
+# Moonshine's public headers (moonshine-cpp.h) live under its source's core/ dir.
+# The target doesn't export an INTERFACE include dir for them, so wire it up.
+FetchContent_GetProperties(moonshine)
+
+if(NOT moonshine_POPULATED)
+    FetchContent_Populate(moonshine)
+endif()
+
+set(MOONSHINE_INCLUDE_DIR "${moonshine_SOURCE_DIR}/core")
+if(NOT EXISTS "${MOONSHINE_INCLUDE_DIR}/moonshine-cpp.h")
+    message(FATAL_ERROR
+        "moonshine-cpp.h not found at ${MOONSHINE_INCLUDE_DIR}. "
+        "Check the Moonshine source layout.")
+endif()
+
+message(STATUS "OLAS: Moonshine headers at ${MOONSHINE_INCLUDE_DIR}")
 
 set(MOONSHINE_TARGET moonshine)
 
@@ -79,6 +96,8 @@ add_executable(olas_win WIN32
 
 target_include_directories(olas_win PRIVATE
     src
+    "${MOONSHINE_INCLUDE_DIR}"
+
 )
 
 if(ONNXRUNTIME_MODE STREQUAL "prebuilt")

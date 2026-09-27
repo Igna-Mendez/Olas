@@ -13,7 +13,60 @@
 #include <thread>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// Windows.h macro pollution guard.
+//
+// moonshine-cpp.h uses identifiers that <windows.h> (specifically wingdi.h
+// and winnt.h) redefine as macros: ERROR -> 0, DELETE -> 0x00010000L,
+// IN/OUT -> <empty>, small -> char, interface -> struct, etc. If those
+// macros are in scope when moonshine-cpp.h is parsed, its enum/class bodies
+// become syntactically invalid. Push them off, include Moonshine, pop them
+// back so the rest of this TU still sees them exactly as before.
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+#  pragma push_macro("ERROR")
+#  pragma push_macro("DELETE")
+#  pragma push_macro("IN")
+#  pragma push_macro("OUT")
+#  pragma push_macro("OPTIONAL")
+#  pragma push_macro("small")
+#  pragma push_macro("near")
+#  pragma push_macro("far")
+#  pragma push_macro("interface")
+#  pragma push_macro("GetObject")
+#  pragma push_macro("CreateFile")
+#  pragma push_macro("LoadImage")
+#  undef ERROR
+#  undef DELETE
+#  undef IN
+#  undef OUT
+#  undef OPTIONAL
+#  undef small
+#  undef near
+#  undef far
+#  undef interface
+#  undef GetObject
+#  undef CreateFile
+#  undef LoadImage
+#endif
+
 #include "moonshine-cpp.h"
+
+#ifdef _WIN32
+#  pragma pop_macro("ERROR")
+#  pragma pop_macro("DELETE")
+#  pragma pop_macro("IN")
+#  pragma pop_macro("OUT")
+#  pragma pop_macro("OPTIONAL")
+#  pragma pop_macro("small")
+#  pragma pop_macro("near")
+#  pragma pop_macro("far")
+#  pragma pop_macro("interface")
+#  pragma pop_macro("GetObject")
+#  pragma pop_macro("CreateFile")
+#  pragma pop_macro("LoadImage")
+#endif
+
 #include "transcript_sink.h"
 
 namespace olas {
