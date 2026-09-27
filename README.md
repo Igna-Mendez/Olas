@@ -1,7 +1,6 @@
 # OLAS for Windows
-
-Windows port of [OLAS](https://github.com/Igna-Mendez/linuxwhisperpipe) —
-Open Local Audio Scribe — using **Moonshine C++** for local speech-to-text
+-Disclaimer- 99% of the code was writing by an AI
+Open Local Audio Scribe — This program uses **Moonshine C++** for local speech-to-text
 and **WASAPI loopback** (via miniaudio) for capture. Native Win32 UI.
 
 - Two languages side-by-side (one pane each), matching the GTK build.
