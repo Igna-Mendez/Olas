@@ -104,6 +104,16 @@ static std::vector<std::string> argv_to_utf8(int &argc_out) {
 
 static const char *DEF_MONITOR_SRC = "auto";
 
+static std::string default_model_dir(int arch, const std::string &lang) {
+    switch (arch) {
+        case ARCH_TINY_STREAMING:   return "models\\tiny-streaming-"   + lang;
+        case ARCH_SMALL_STREAMING:  return "models\\small-streaming-"  + lang;
+        case ARCH_MEDIUM_STREAMING: return "models\\medium-streaming-" + lang;
+        case ARCH_TINY:             return "models\\tiny-" + lang;
+        default:                    return "models\\base-" + lang;
+    }
+}
+
 static void usage(const char *prog) {
     std::fprintf(stderr,
         "olas_win — Open Local Audio Scribe for Windows\n\n"
@@ -113,11 +123,12 @@ static void usage(const char *prog) {
         "  -l, --language CODE[,CODE] Comma-separated language codes [en,es]\n"
         "  -r, --rms THRESHOLD        Silence RMS threshold [%.0f]\n"
         "  -q, --chunk-ms MS          Capture chunk in ms [%d]\n"
+        "  -v, --verbose              Verbose logging to %s\n"
         "  -h, --help                 Show this help\n\n"
+        "Default architecture: SmallStreaming (TinyStreaming on <=4-thread CPUs)\n"
         "Architecture numbers:\n"
-        "  0=Tiny  1=Base  2=TinyStreaming  3=BaseStreaming\n"
-        "  4=SmallStreaming  5=MediumStreaming\n",
-        prog, DEF_SILENCE_RMS, DEFAULT_CAPTURE_CHUNK_MS);
+        "  0=Tiny  1=Base  2=TinyStreaming  4=SmallStreaming  5=MediumStreaming\n"
+        prog, DEF_SILENCE_RMS, DEFAULT_CAPTURE_CHUNK_MS, VERBOSE_LOG_FILE);
 }
 
 // ---------------- UI callbacks ----------------
@@ -144,6 +155,9 @@ static void on_device(int device_index) {
 // ---------------- main ----------------
 
 int main() {
+    if (!std::getenv("MOONSHINE_ORT_SINGLE_THREAD"))
+        _putenv_s("MOONSHINE_ORT_SINGLE_THREAD", "1");
+
     int argc = 0;
     std::vector<std::string> argv = argv_to_utf8(argc);
 
@@ -176,6 +190,8 @@ int main() {
                 }
                 arches.push_back(v);
             }
+        } else if (a == "-v" || a == "--verbose") {
+            g_verbose = true;
         } else if (a == "-r" || a == "--rms") {
             if (!need("--rms")) return 1;
             double v;
@@ -214,15 +230,21 @@ int main() {
         return 1;
     }
 
-    if (arches.empty()) arches.assign(languages.size(), ARCH_BASE);
-    else if (arches.size() == 1 && languages.size() > 1)
+    if (arches.empty()) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int def_arch = (hw && hw <= 4) ? ARCH_TINY_STREAMING
+                                             : ARCH_SMALL_STREAMING;
+        arches.assign(languages.size(), def_arch);
+    } else if (arches.size() == 1 && languages.size() > 1)
         arches.assign(languages.size(), arches.front());
     else if (arches.size() != languages.size()) {
         std::fprintf(stderr, "--arch count mismatch\n"); return 1;
     }
 
     if (models.empty()) {
-        for (const auto &l : languages) models.push_back("base-" + l);
+        models.reserve(languages.size());
+        for (size_t i = 0; i < languages.size(); ++i)
+            models.push_back(default_model_dir(arches[i], languages[i]));
     } else if (models.size() == 1 && languages.size() > 1) {
         models.assign(languages.size(), models.front());
     } else if (models.size() != languages.size()) {
@@ -243,6 +265,20 @@ int main() {
         MessageBoxW(nullptr, L"Could not create the notes file.",
                     L"OLAS", MB_OK | MB_ICONERROR);
         return 1;
+    }
+
+    if (g_verbose) {
+        g_verbose_log = std::fopen(VERBOSE_LOG_FILE, "w");
+        if (g_verbose_log) {
+            std::fprintf(g_verbose_log, "OLAS verbose log\nlanguages:");
+            for (auto &l : languages) std::fprintf(g_verbose_log, " %s", l.c_str());
+            std::fprintf(g_verbose_log, "\narches:");
+            for (auto &a : arches) std::fprintf(g_verbose_log, " %d", a);
+            std::fprintf(g_verbose_log, "\nmodels:");
+            for (auto &m : models) std::fprintf(g_verbose_log, " %s", m.c_str());
+            std::fprintf(g_verbose_log, "\n\n");
+            std::fflush(g_verbose_log);
+        }
     }
 
     // Init capture (miniaudio / WASAPI).
@@ -321,6 +357,7 @@ int main() {
     win32_ui_shutdown();
     capture_uninit();
 
+    if (g_verbose_log) { std::fclose(g_verbose_log); g_verbose_log = nullptr; }
     if (g_notes) { std::fclose(g_notes); g_notes = nullptr; }
 
     return 0;

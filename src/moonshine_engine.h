@@ -75,27 +75,27 @@ namespace olas {
 constexpr int SAMPLE_RATE          = 16000;
 constexpr int VAD_FRAME_MS         = 20;
 constexpr int VAD_FRAME_SAMPLES    = SAMPLE_RATE / 1000 * VAD_FRAME_MS;
-constexpr int VAD_HANGOVER_MS      = 600;
+constexpr int VAD_HANGOVER_MS      = 350;
 constexpr int VAD_PREROLL_MS       = 300;
 
 constexpr int PARTIAL_INTERVAL_MS       = 500;
 constexpr int PARTIAL_INTERVAL_SAMPLES  = SAMPLE_RATE / 1000 * PARTIAL_INTERVAL_MS;
 constexpr int MIN_PARTIAL_AUDIO_MS      = 300;
-constexpr int MAX_PARTIAL_WINDOW_MS     = 4000;
+constexpr int MAX_PARTIAL_WINDOW_MS     = 2500;
 constexpr int MAX_PARTIAL_WINDOW_SAMPLES= SAMPLE_RATE / 1000 * MAX_PARTIAL_WINDOW_MS;
 
 constexpr int MAX_SEGMENT_MS       = 8000;
 constexpr int MAX_SEGMENT_SAMPLES  = SAMPLE_RATE / 1000 * MAX_SEGMENT_MS;
 constexpr size_t MAX_FINAL_BACKLOG = 16;
 
-constexpr int DEFAULT_CAPTURE_CHUNK_MS = 20;
-constexpr size_t AUDIO_QUEUE_MAX_CHUNKS = 600;
+constexpr int DEFAULT_CAPTURE_CHUNK_MS = 50;
+constexpr size_t AUDIO_QUEUE_MAX_CHUNKS = 240;
 
 constexpr int ARCH_TINY             = 0;
 constexpr int ARCH_BASE             = 1;
 constexpr int ARCH_TINY_STREAMING   = 2;
 constexpr int ARCH_BASE_STREAMING   = 3;
-constexpr int ARCH_SMALL_STREAMING  = 4;
+constexpr int ARCH_SMALL_STREAMING  = 4; // default
 constexpr int ARCH_MEDIUM_STREAMING = 5;
 
 constexpr double DEF_SILENCE_RMS    = 100.0;
@@ -107,8 +107,15 @@ struct LanguageConfig {
     int         arch = ARCH_BASE;
 };
 
+// ---------- global verbose flag ----------
+inline bool  g_verbose     = false;
+inline FILE *g_verbose_log = nullptr;
+
+constexpr const char *VERBOSE_LOG_FILE = "olas-debug.log";
+
 // ---------- small helpers ----------
 bool is_streaming_arch(int a);
+// valid_arch: false for a == ARCH_BASE_STREAMING (3); otherwise ARCH_TINY..ARCH_MEDIUM_STREAMING
 bool valid_arch(int a);
 bool is_supported_language(const std::string &lang);
 std::vector<std::string> split_csv(const std::string &s);

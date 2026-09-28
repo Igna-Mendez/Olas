@@ -81,7 +81,10 @@ bool parse_double(const char *s, double &out) {
 bool is_streaming_arch(int a) {
     return a >= ARCH_TINY_STREAMING && a <= ARCH_MEDIUM_STREAMING;
 }
-bool valid_arch(int a) { return a >= ARCH_TINY && a <= ARCH_MEDIUM_STREAMING; }
+bool valid_arch(int a) {
+    if (a == ARCH_BASE_STREAMING) return false;
+    return a >= ARCH_TINY && a <= ARCH_MEDIUM_STREAMING;
+}
 
 bool is_supported_language(const std::string &lang) {
 #ifdef OLAS_MOONSHINE_EXTENDED_LANGUAGES
@@ -286,6 +289,14 @@ public:
         emit_partial(e.line.text);
     }
     void onLineCompleted(const moonshine::LineCompleted &e) override {
+        if (g_verbose && g_verbose_log) {
+            std::fprintf(g_verbose_log,
+                         "[%s] latency=%d ms  text=\"%.80s\"\n",
+                         language_.c_str(),
+                         e.line.lastTranscriptionLatencyMs,
+                         e.line.text.c_str());
+            std::fflush(g_verbose_log);
+        }
         emit_final(e.line.text, e.line.startTime);
     }
     void onError(const moonshine::Error &e) override {
@@ -336,8 +347,12 @@ public:
                     const std::string &language, int slot_idx)
         : listener_(std::make_unique<PrintListener>(
               notes, sink, language, slot_idx, session_start)) {
+        moonshine::Options opts = {
+            {"transcription_interval", "0.3"},
+            {"return_audio_data",      "false"},
+        };
         transcriber_ = std::make_unique<moonshine::Transcriber>(
-            model_path, to_model_arch(arch), 0.25);
+            model_path, to_model_arch(arch), 0.3, "", opts);
         transcriber_->addListener(listener_.get());
         transcriber_->start();
     }
@@ -399,10 +414,11 @@ public:
         const moonshine::ModelArch ma =
             (arch == ARCH_TINY) ? moonshine::ModelArch::TINY
                                 : moonshine::ModelArch::BASE;
+        moonshine::Options opts = { {"return_audio_data", "false"} };
         transcriber_ = std::make_unique<moonshine::Transcriber>(
-            model_path, ma, 0.25);
+            model_path, ma, 0.25, "", opts);
         inference_ = std::make_unique<InferenceThread>(
-            transcriber_.get(), listener_.get());
+            transcriber_.get(), listener_.get(), &last_inference_ms_);
     }
 
     void set_session_start(std::chrono::system_clock::time_point tp) {
@@ -440,8 +456,11 @@ public:
                 const uint64_t since   = total_seen_ - last_partial_at_;
                 const bool enough = elapsed >=
                     (uint64_t)(SAMPLE_RATE * MIN_PARTIAL_AUDIO_MS / 1000);
-                const bool due = last_partial_at_ == 0 ||
-                    since >= (uint64_t)PARTIAL_INTERVAL_SAMPLES;
+                const int64_t last_ms = last_inference_ms_.load();
+                const uint64_t min_gap = std::max<uint64_t>(
+                    PARTIAL_INTERVAL_SAMPLES,
+                    last_ms > 0 ? (uint64_t)last_ms * 32u : 0u);
+                const bool due = last_partial_at_ == 0 || since >= min_gap;
                 if (enough && due) {
                     const size_t win = std::min(audio.size(),
                         (size_t)MAX_PARTIAL_WINDOW_SAMPLES);
@@ -464,8 +483,9 @@ public:
 private:
     class InferenceThread {
     public:
-        InferenceThread(moonshine::Transcriber *t, PrintListener *l)
-        : t_(t), l_(l) {
+        InferenceThread(moonshine::Transcriber *t, PrintListener *l,
+                        std::atomic<int64_t> *timing_ms)
+        : t_(t), l_(l), timing_ms_(timing_ms) {
             th_ = std::thread([this] {
                run();
             });
@@ -558,12 +578,16 @@ private:
                 const auto ms = std::chrono::duration_cast<
                 std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t0).count();
-                    std::fprintf(stderr,
+                if (timing_ms_) timing_ms_->store(ms);
+                if (g_verbose && g_verbose_log) {
+                    std::fprintf(g_verbose_log,
                                  "[transcribe %s] audio=%.2fs  wall=%lldms  text=\"%.40s\"\n",
                                  is_final ? "final" : "partial",
                                  (double)w.audio.size() / SAMPLE_RATE,
                                  (long long)ms,
                                  combined.c_str());
+                    std::fflush(g_verbose_log);
+                }
                     if (combined.empty()) return;
 
                     if (is_final) l_->emit_final(combined, rel + first_offset);
@@ -575,9 +599,10 @@ private:
             }
         }
 
-        moonshine::Transcriber *t_;
-        PrintListener          *l_;
-        std::thread             th_;
+        moonshine::Transcriber    *t_;
+        PrintListener             *l_;
+        std::atomic<int64_t>      *timing_ms_ = nullptr;
+        std::thread                th_;
         std::mutex              m_;
         std::condition_variable cv_;
         std::deque<Work>        finals_;
@@ -590,6 +615,7 @@ private:
     std::unique_ptr<PrintListener>          listener_;
     std::unique_ptr<StatefulVad>            vad_;
     std::unique_ptr<InferenceThread>        inference_;
+    std::atomic<int64_t>                    last_inference_ms_{0};
     uint64_t                                total_seen_ = 0;
     uint64_t                                last_partial_at_ = 0;
     std::vector<int16_t>                    pcm_rem_;
@@ -663,6 +689,9 @@ struct Engine::Impl {
         s.queue = std::make_unique<AudioQueue>(AUDIO_QUEUE_MAX_CHUNKS);
         AudioQueue *q = s.queue.get();
         s.thread = std::thread([&s, q] {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
             std::vector<int16_t> chunk;
             while (q->pop(chunk)) {
                 if (s.need_reset && s.need_reset->exchange(false))

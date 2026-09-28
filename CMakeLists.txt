@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OLAS VERSION 0.1.0 LANGUAGES C CXX)
+project(OLAS VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -9,6 +9,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(FATAL_ERROR
+        "Debug builds are ~5x slower. Reconfigure with -DCMAKE_BUILD_TYPE=Release")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -116,7 +121,6 @@ string(TIMESTAMP OLAS_BUILD_DATE "%Y-%m-%d %H:%M:%S UTC" UTC)
 
 # GitHub repo to check for updates. "owner/name" form.
 # Leave EMPTY to disable the update check entirely.
-# Change this to your actual public repo before shipping.
 set(OLAS_UPDATE_REPO "Igna-Mendez/Olas" CACHE STRING
     "GitHub repo (owner/name) for update checks; empty to disable")
 
@@ -135,7 +139,6 @@ add_executable(olas_win WIN32
 target_include_directories(olas_win PRIVATE
     src
     "${MOONSHINE_INCLUDE_DIR}"
-
 )
 
 if(ONNXRUNTIME_MODE STREQUAL "prebuilt")
@@ -210,19 +213,31 @@ if(MINGW)
     )
 endif()
 
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(FATAL_ERROR
-        "Debug builds are ~5x slower. Reconfigure with -DCMAKE_BUILD_TYPE=Release")
+# ---------------------------------------------------------------------------
+# Locate onnxruntime.dll after Moonshine is built so it can be copied to the
+# exe dir. Same generator expression the dist target uses below.
+# ---------------------------------------------------------------------------
+set(ORT_DLL_SOURCE "$<TARGET_FILE_DIR:moonshine>/onnxruntime.dll")
+
+# ---------------------------------------------------------------------------
+# Post-build: make the build tree runnable in place
+# ---------------------------------------------------------------------------
+if(WIN32)
+    add_custom_command(TARGET olas_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ORT_DLL_SOURCE}"
+            "$<TARGET_FILE_DIR:olas_win>/onnxruntime.dll"
+        COMMENT "Copying onnxruntime.dll next to olas_win.exe"
+        VERBATIM
+    )
 endif()
-# ---------------------------------------------------------------------------
-# Post-build: copy runtime DLLs next to olas_win.exe
-# ---------------------------------------------------------------------------
+
 if(ONNXRUNTIME_MODE STREQUAL "prebuilt")
     add_custom_command(TARGET olas_win POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
             "$<TARGET_FILE_DIR:olas_win>"
-        COMMENT "Copying onnxruntime.dll next to olas_win.exe"
+        COMMENT "Copying prebuilt onnxruntime.dll next to olas_win.exe"
         VERBATIM
     )
 endif()
@@ -241,22 +256,47 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Convenience target: distributable folder
+#
+# Produces ${CMAKE_BINARY_DIR}/dist/OLAS-win64/ containing everything a user
+# needs to run OLAS: the exe, the ONNX Runtime DLL, the launcher .bat, the
+# models folder, and the docs. Point a zip tool at this folder.
 # ---------------------------------------------------------------------------
+set(DIST_DIR "${CMAKE_BINARY_DIR}/dist/OLAS-win64")
+set(DIST_ZIP "${CMAKE_BINARY_DIR}/dist/OLAS-win64-${PROJECT_VERSION}.zip")
+
 add_custom_target(dist
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist/OLAS-win64"
-    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:olas_win>" "${CMAKE_BINARY_DIR}/dist/OLAS-win64/"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/models" "${CMAKE_BINARY_DIR}/dist/OLAS-win64/models"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_DIR}"
+    # Binary
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "$<TARGET_FILE:olas_win>" "${DIST_DIR}/"
+    # Runtime DLL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ORT_DLL_SOURCE}" "${DIST_DIR}/onnxruntime.dll"
+    # Models (base-en, base-es, small-streaming-en, whatever's in models/)
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/models" "${DIST_DIR}/models"
+    # Launcher + docs
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/OLAS.bat"   "${DIST_DIR}/OLAS.bat"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/README.md"  "${DIST_DIR}/README.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/LICENSE"    "${DIST_DIR}/LICENSE"
     DEPENDS olas_win
-    COMMENT "Packaging OLAS-win64 distribution folder"
+    COMMENT "Packaging OLAS-win64 distribution folder into ${DIST_DIR}"
     VERBATIM
 )
-# Copy the correct ONNX Runtime DLL next to olas_win.exe on Windows
-if(WIN32)
-    add_custom_command(TARGET olas_win POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE_DIR:moonshine>/onnxruntime.dll"
-            "$<TARGET_FILE_DIR:olas_win>/onnxruntime.dll"
-        COMMENT "Copying onnxruntime.dll next to olas_win.exe"
-        VERBATIM
-    )
-endif()
+
+# ---------------------------------------------------------------------------
+# Convenience target: build dist, then zip it.
+#   cmake --build . --target zip
+# -> ${CMAKE_BINARY_DIR}/dist/OLAS-win64-<version>.zip
+# ---------------------------------------------------------------------------
+add_custom_target(zip
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${DIST_ZIP}"
+    COMMAND ${CMAKE_COMMAND} -E tar "cfv" "${DIST_ZIP}" --format=zip
+            -- "${DIST_DIR}"
+    DEPENDS dist
+    COMMENT "Zipping distribution folder -> ${DIST_ZIP}"
+    VERBATIM
+)
