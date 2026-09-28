@@ -348,11 +348,11 @@ public:
         : listener_(std::make_unique<PrintListener>(
               notes, sink, language, slot_idx, session_start)) {
         moonshine::Options opts = {
-            {"transcription_interval", "0.3"},
+            {"transcription_interval", "0.5"},
             {"return_audio_data",      "false"},
         };
         transcriber_ = std::make_unique<moonshine::Transcriber>(
-            model_path, to_model_arch(arch), 0.3, "", opts);
+            model_path, to_model_arch(arch), 0.5, "", opts);
         transcriber_->addListener(listener_.get());
         transcriber_->start();
     }
@@ -416,7 +416,7 @@ public:
                                 : moonshine::ModelArch::BASE;
         moonshine::Options opts = { {"return_audio_data", "false"} };
         transcriber_ = std::make_unique<moonshine::Transcriber>(
-            model_path, ma, 0.25, "", opts);
+            model_path, ma, 0.5, "", opts);
         inference_ = std::make_unique<InferenceThread>(
             transcriber_.get(), listener_.get(), &last_inference_ms_);
     }
@@ -688,11 +688,13 @@ struct Engine::Impl {
     void start_thread(Slot &s) {
         s.queue = std::make_unique<AudioQueue>(AUDIO_QUEUE_MAX_CHUNKS);
         AudioQueue *q = s.queue.get();
-        s.thread = std::thread([&s, q] {
-#ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#endif
-            std::vector<int16_t> chunk;
+
+            s.thread = std::thread([&s, q] {
+                // Thread priority stays at NORMAL. Deprioritizing the worker just
+                // defers its work and lets the queue back up; reducing the amount of
+                // work (interval, queue) is what actually reduces CPU.
+                std::vector<int16_t> chunk;
+
             while (q->pop(chunk)) {
                 if (s.need_reset && s.need_reset->exchange(false))
                     s.reset();

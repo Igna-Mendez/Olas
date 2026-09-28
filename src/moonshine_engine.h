@@ -89,7 +89,7 @@ constexpr int MAX_SEGMENT_SAMPLES  = SAMPLE_RATE / 1000 * MAX_SEGMENT_MS;
 constexpr size_t MAX_FINAL_BACKLOG = 16;
 
 constexpr int DEFAULT_CAPTURE_CHUNK_MS = 50;
-constexpr size_t AUDIO_QUEUE_MAX_CHUNKS = 240;
+constexpr size_t AUDIO_QUEUE_MAX_CHUNKS = 120;
 
 constexpr int ARCH_TINY             = 0;
 constexpr int ARCH_BASE             = 1;

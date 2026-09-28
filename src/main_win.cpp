@@ -116,19 +116,19 @@ static std::string default_model_dir(int arch, const std::string &lang) {
 
 static void usage(const char *prog) {
     std::fprintf(stderr,
-        "olas_win — Open Local Audio Scribe for Windows\n\n"
-        "Usage: %s [options]\n\n"
-        "  -m, --model PATH[,PATH]    Model directory per language\n"
-        "  -a, --arch N[,N]           Architecture 0-5 per language [1=Base]\n"
-        "  -l, --language CODE[,CODE] Comma-separated language codes [en,es]\n"
-        "  -r, --rms THRESHOLD        Silence RMS threshold [%.0f]\n"
-        "  -q, --chunk-ms MS          Capture chunk in ms [%d]\n"
-        "  -v, --verbose              Verbose logging to %s\n"
-        "  -h, --help                 Show this help\n\n"
-        "Default architecture: SmallStreaming (TinyStreaming on <=4-thread CPUs)\n"
-        "Architecture numbers:\n"
-        "  0=Tiny  1=Base  2=TinyStreaming  4=SmallStreaming  5=MediumStreaming\n"
-        prog, DEF_SILENCE_RMS, DEFAULT_CAPTURE_CHUNK_MS, VERBOSE_LOG_FILE);
+                 "olas_win - Open Local Audio Scribe for Windows\n\n"
+                 "Usage: %s [options]\n\n"
+                 "  -m, --model PATH[,PATH]    Model directory per language\n"
+                 "  -a, --arch N[,N]           Architecture per language [1=Base]\n"
+                 "  -l, --language CODE[,CODE] Comma-separated language codes [en,es]\n"
+                 "  -r, --rms THRESHOLD        Silence RMS threshold [%.0f]\n"
+                 "  -q, --chunk-ms MS          Capture chunk in ms [%d]\n"
+                 "  -v, --verbose              Verbose logging to %s\n"
+                 "  -h, --help                 Show this help\n\n"
+                 "Default architecture: SmallStreaming (TinyStreaming on <=4-thread CPUs)\n"
+                 "Architecture numbers:\n"
+                 "  0=Tiny  1=Base  2=TinyStreaming  4=SmallStreaming  5=MediumStreaming\n",
+                 prog, DEF_SILENCE_RMS, DEFAULT_CAPTURE_CHUNK_MS, VERBOSE_LOG_FILE);
 }
 
 // ---------------- UI callbacks ----------------
@@ -231,10 +231,10 @@ int main() {
     }
 
     if (arches.empty()) {
-        const unsigned hw = std::thread::hardware_concurrency();
-        const int def_arch = (hw && hw <= 4) ? ARCH_TINY_STREAMING
-                                             : ARCH_SMALL_STREAMING;
-        arches.assign(languages.size(), def_arch);
+        // Always default to Small Streaming. Tiny Streaming is still available
+        // via -a 2 for users on genuinely small CPUs, but Small is what we want
+        // as the out-of-the-box experience.
+        arches.assign(languages.size(), ARCH_SMALL_STREAMING);
     } else if (arches.size() == 1 && languages.size() > 1)
         arches.assign(languages.size(), arches.front());
     else if (arches.size() != languages.size()) {

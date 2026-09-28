@@ -77,7 +77,11 @@ enum {
     ID_COLLAPSE  = 108,
     ID_OPTIONS   = 109,
     ID_RESTORE   = 110,
+
 };
+// Cap the per-pane transcript log. See olas-gtk.cpp for the same logic.
+static constexpr size_t MAX_LOG_LINES = 4000;
+static constexpr size_t TRIM_TO_LINES = 2000;
 
 // Popup menu command IDs.
 enum {
@@ -121,6 +125,9 @@ static HFONT  g_font_label       = nullptr;
 static HFONT  g_font_glyph       = nullptr;
 static HFONT  g_font_btn         = nullptr;
 static int    g_current_device_index = 0;
+static UINT     g_dpi = 96;
+static int      D(int px);
+static HBRUSH   bg_brush(void);
 
 // ---------------- custom button ----------------
 
@@ -365,7 +372,7 @@ static HFONT       g_font_ui          = nullptr;
 static std::vector<std::unique_ptr<Pane>> g_panes;
 static int         g_body_pt       = 14;
 static bool        g_show_stamps   = true;
-static UINT        g_dpi           = 96;
+
 
 static Pane *g_floated_pane       = nullptr;
 static Pane *g_collapsed_pane     = nullptr;
@@ -644,6 +651,35 @@ static void pane_apply(Pane *p, const Update &u) {
         re_insert(e, L"\n", false, false);
         p->partial_start = edit_length(e);
         p->log.push_back({ u.prefix, u.body, false });
+
+        if (p->log.size() > MAX_LOG_LINES) {
+            const size_t drop = p->log.size() - TRIM_TO_LINES;
+            p->log.erase(p->log.begin(), p->log.begin() + (ptrdiff_t)drop);
+            // Rebuild the RichEdit. WM_SETREDRAW is already FALSE, so no
+            // flicker reaches the user.
+            SetWindowTextW(p->edit, L"");
+            p->partial_start = 0;
+            for (const auto &line : p->log) {
+                if (line.is_error) {
+                    std::wstring w = L"[error] ";
+                    wchar_t *wb = a2w(line.body.c_str());
+                    if (wb) { w += wb; free(wb); }
+                    w += L"\n";
+                    re_insert(p->edit, w.c_str(), false, true);
+                } else {
+                    if (g_show_stamps) {
+                        wchar_t *wp = a2w(line.prefix.c_str());
+                        if (wp) { re_insert(p->edit, wp, true, false); free(wp); }
+                    }
+                    wchar_t *wb = a2w(line.body.c_str());
+                    if (wb) { re_insert(p->edit, wb, false, false); free(wb); }
+                    re_insert(p->edit, L"\n", false, false);
+                }
+            }
+            p->partial_start = edit_length(p->edit);
+        }
+
+        if (p->follow_tail) pane_scroll_to_bottom(p);
     }
 
     SendMessageW(e, WM_SETREDRAW, TRUE, 0);
