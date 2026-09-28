@@ -33,3 +33,9 @@ void win32_ui_set_pane_enabled(int slot, int enabled);
 
 // UI-thread: destroy the window and free resources.
 void win32_ui_shutdown();
+
+// Thread-safe: post a "new version available" prompt to the UI thread.
+// Does nothing if the main window isn't up yet or `url` is empty.
+void win32_ui_show_update_prompt(const char* local_sha,
+                                 const char* remote_sha,
+                                 const char* url);

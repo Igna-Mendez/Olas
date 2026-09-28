@@ -59,7 +59,7 @@ static void load_richedit(void) {
 
 #define WM_APP_UPDATE (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
-
+#define WM_APP_UPDATE_AVAIL (WM_APP + 3)
 // ---------------- IDs ----------------
 
 enum {
@@ -141,6 +141,11 @@ struct Update {
     std::string body;
     bool  is_final;
     bool  is_error;
+};
+struct UpdateAvail {
+    std::string local_sha;
+    std::string remote_sha;
+    std::string url;
 };
 
 static HWND        g_main_window    = nullptr;
@@ -983,6 +988,41 @@ static void re_insert(HWND edit, const wchar_t *text, bool is_stamp,
                                                                                          if (pp->float_window) pane_reattach(pp.get());
                                                                                          PostQuitMessage(0);
                                                                          return 0;
+                                                                                 case WM_APP_UPDATE_AVAIL: {
+                                                                                     UpdateAvail *ua = (UpdateAvail *)lp;
+                                                                                     if (ua) {
+                                                                                         std::wstring msg =
+                                                                                         L"A newer version of OLAS is available.\n\n"
+                                                                                         L"  Your build:    ";
+                                                                                         {
+                                                                                             wchar_t buf[32];
+                                                                                             wsprintfW(buf, L"%.12s", ua->local_sha.c_str());
+                                                                                             msg += buf;
+                                                                                         }
+                                                                                         msg += L"\n  Latest (main): ";
+                                                                                         {
+                                                                                             wchar_t buf[32];
+                                                                                             wsprintfW(buf, L"%.12s", ua->remote_sha.c_str());
+                                                                                             msg += buf;
+                                                                                         }
+                                                                                         msg += L"\n\nOpen the project page in your browser "
+                                                                                         L"to download the update?";
+
+                                                                                         int r = MessageBoxW(g_main_window, msg.c_str(),
+                                                                                                             L"Update Available",
+                                                                                                             MB_YESNO | MB_ICONINFORMATION);
+                                                                                         if (r == IDYES && !ua->url.empty()) {
+                                                                                             wchar_t *url_w = a2w(ua->url.c_str());
+                                                                                             if (url_w) {
+                                                                                                 ShellExecuteW(nullptr, L"open", url_w,
+                                                                                                               nullptr, nullptr, SW_SHOWNORMAL);
+                                                                                                 free(url_w);
+                                                                                             }
+                                                                                         }
+                                                                                         delete ua;
+                                                                                     }
+                                                                                     return 0;
+                                                                                 }
                                                                      }
                                                                      return DefWindowProcW(hwnd, msg, wp, lp);
                                                                  }
@@ -1194,6 +1234,17 @@ static void re_insert(HWND edit, const wchar_t *text, bool is_stamp,
                                                                                                Pane *p = g_panes[slot].get();
                                                                                                p->enabled = enabled != 0;
                                                                                                SetWindowTextW(p->toggle_btn, p->enabled ? L"\u23F9" : L"\u25B6");
+                                                                                           }
+                                                                                           void win32_ui_show_update_prompt(const char* local_sha,
+                                                                                                                            const char* remote_sha,
+                                                                                                                            const char* url)
+                                                                                           {
+                                                                                               if (!g_main_window) return;
+                                                                                               UpdateAvail *ua = new UpdateAvail();
+                                                                                               ua->local_sha  = local_sha  ? local_sha  : "";
+                                                                                               ua->remote_sha = remote_sha ? remote_sha : "";
+                                                                                               ua->url        = url        ? url        : "";
+                                                                                               PostMessageW(g_main_window, WM_APP_UPDATE_AVAIL, 0, (LPARAM)ua);
                                                                                            }
 
                                                                                            void win32_ui_shutdown(void) {

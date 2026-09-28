@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include "update_check.h"
 #include <vector>
 #include <avrt.h>
 
@@ -32,6 +33,7 @@ using namespace olas;
 static std::vector<LanguageConfig> g_configs;
 static double g_silence_rms        = DEF_SILENCE_RMS;
 static int    g_capture_chunk_ms   = DEFAULT_CAPTURE_CHUNK_MS;
+static bool   g_no_update_check    = false;
 
 static FILE *g_notes   = nullptr;
 static std::atomic<bool> g_running{true};
@@ -188,6 +190,9 @@ int main() {
                 std::fprintf(stderr, "invalid --chunk-ms\n"); return 1;
             }
             g_capture_chunk_ms = v;
+        } else if (a == "--no-update-check") {
+            g_no_update_check = true;
+
         } else if (a == "-h" || a == "--help") {
             usage(argv[0].c_str()); return 0;
         } else {
@@ -287,6 +292,19 @@ int main() {
     cargs.engine = &engine;
     cargs.chunk_samples = SAMPLE_RATE * g_capture_chunk_ms / 1000;
     std::thread cap_thread(capture_loop, &cargs);
+
+    if (!g_no_update_check && std::strcmp(OLAS_UPDATE_REPO, "") != 0) {
+        std::thread([]{
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            olas::UpdateInfo info = olas::check_for_updates(OLAS_UPDATE_REPO, 5000);
+            if (info.completed && info.outdated) {
+                win32_ui_show_update_prompt(
+                    olas::build_commit_sha(),
+                                            info.remote_sha.c_str(),
+                                            info.html_url.c_str());
+            }
+        }).detach();
+    }
 
     // Message loop (blocks until the main window closes).
     win32_ui_run(on_toggle, on_device);
