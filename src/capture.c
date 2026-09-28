@@ -5,14 +5,17 @@
  * endpoint of a playback device with AUDCLNT_STREAMFLAGS_LOOPBACK and
  * delivers its rendered audio.  We set config.sampleRate to 16000 and
  * capture.channels to 1 so miniaudio's built-in resampler + channel mixer
- * do the work in the backend thread; the data callback only copies s16
- * frames into the ring.
+ * do the work in the backend thread.  The data callback then only copies
+ * s16 frames into the ring.
  *
- * Ring indices are _Atomic with acquire/release on the write side so the
- * data writes performed by the WASAPI callback are guaranteed visible to
- * the consumer before it observes the advanced write pointer.  The ring
- * length is a power of two so both sides can mask instead of taking a
- * per-sample integer modulo on the realtime thread.
+ * Ring indices are 64-bit atomics so the write performed on the WASAPI
+ * callback thread is guaranteed visible to the consumer before it observes
+ * the advanced write pointer.  The ring length is a power of two so both
+ * sides can mask instead of taking a per-sample integer modulo.
+ *
+ * MSVC's <stdatomic.h> is gated behind /experimental:c11atomics, so we wrap
+ * the two operations we need behind tiny helper functions that use the
+ * Interlocked* intrinsics on MSVC and GCC/Clang atomics everywhere else.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -24,23 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-
-/* MSVC's C11 atomics require /experimental:c11atomics and aren't on by
- * default. Wrap the two 64-bit atomic ops we need behind tiny macros so this
- * file compiles cleanly on MSVC and clang/gcc without any build-flag
- * changes. On MSVC the Interlocked* intrinsics give a full barrier on x64;
- * on everything else we use C11 stdatomic. */
-#ifdef _MSC_VER
-#  include <intrin.h>
-typedef volatile LONG64      atomic_u64;
-#  define atomic_u64_load(p)     ((ma_uint64)_InterlockedCompareExchange64((volatile LONG64 *)(p), 0, 0))
-#  define atomic_u64_store(p, v) ((void)_InterlockedExchange64((volatile LONG64 *)(p), (LONG64)(v)))
-#else
-#  include <stdatomic.h>
-typedef _Atomic ma_uint64    atomic_u64;
-#  define atomic_u64_load(p)     atomic_load_explicit((p), memory_order_acquire)
-#  define atomic_u64_store(p, v) atomic_store_explicit((p), (v), memory_order_release)
-#endif
 
 #include "miniaudio.h"
 #include "capture.h"
@@ -55,6 +41,27 @@ typedef _Atomic ma_uint64    atomic_u64;
 #define RING_FRAMES ((ma_uint64)1u << 19)
 #define RING_MASK   (RING_FRAMES - 1u)
 
+/* ---------- 64-bit atomic helpers ---------- */
+
+static ma_uint64 atomic_load_u64(volatile ma_uint64 *p) {
+#ifdef _MSC_VER
+    return (ma_uint64)InterlockedCompareExchange64(
+        (volatile LONG64 *)p, 0, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void atomic_store_u64(volatile ma_uint64 *p, ma_uint64 v) {
+#ifdef _MSC_VER
+    InterlockedExchange64((volatile LONG64 *)p, (LONG64)v);
+#else
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
+/* ---------- module state ---------- */
+
 static ma_context  g_ctx;
 static ma_device   g_dev;
 static int         g_chunk_samples = 0;
@@ -65,8 +72,8 @@ static ma_bool32     g_dev_is_default[MAX_DEVICES];
 static int           g_n_devices = 0;
 
 static int16_t             g_ring[RING_FRAMES];
-static atomic_u64          g_ring_read    = 0;
-static atomic_u64          g_ring_written = 0;
+static volatile ma_uint64  g_ring_read    = 0;
+static volatile ma_uint64  g_ring_written = 0;
 
 static HANDLE g_have_chunk = NULL;
 static int    g_ctx_ok = 0;
@@ -130,18 +137,18 @@ static void ma_data_callback(ma_device *pDevice, void *pOut,
     if (!g_started) return;
 
     const int16_t *in = (const int16_t *)pIn;
-    ma_uint64 w = atomic_u64_load(&g_ring_written);
+    ma_uint64 w = atomic_load_u64(&g_ring_written);
 
     for (ma_uint32 i = 0; i < frameCount; i++)
         g_ring[(w + i) & RING_MASK] = in[i];
 
     w += frameCount;
-    /* Release: sample writes must be visible before the new write pointer. */
-    atomic_u64_store(&g_ring_written, w);
+    atomic_store_u64(&g_ring_written, w);
 
-    const ma_uint64 r = atomic_u64_load(&g_ring_read);
+    const ma_uint64 r = atomic_load_u64(&g_ring_read);
     if (w - r >= (ma_uint64)g_chunk_samples)
         SetEvent(g_have_chunk);
+}
 
 int capture_start(int device_index) {
     if (g_chunk_samples <= 0 || (ma_uint64)g_chunk_samples > RING_FRAMES) {
@@ -150,6 +157,8 @@ int capture_start(int device_index) {
     }
 
     ma_device_config cfg = ma_device_config_init(ma_device_type_loopback);
+    cfg.performanceProfile = ma_performance_profile_conservative;
+    cfg.wasapi.usage       = ma_wasapi_usage_pro_audio;
     cfg.sampleRate = SAMPLE_RATE;
     cfg.capture.channels = 1;
     cfg.capture.format   = ma_format_s16;
@@ -169,8 +178,8 @@ int capture_start(int device_index) {
 
     ResetEvent(g_have_chunk);
     EnterCriticalSection(&g_cs);
-    atomic_u64_store(&g_ring_read,    0);
-    atomic_u64_store(&g_ring_written, 0);
+    atomic_store_u64(&g_ring_read,    0);
+    atomic_store_u64(&g_ring_written, 0);
     g_started = 1;
     LeaveCriticalSection(&g_cs);
     return 1;
@@ -220,10 +229,8 @@ int capture_read_chunk(int16_t *out) {
             if (!started) return 0;
             continue;
         }
-
-        /* Acquire: pairs with the producer's release store above. */
-        const ma_uint64 w = atomic_u64_load(&g_ring_written);
-        const ma_uint64 r = atomic_u64_load(&g_ring_read);
+        const ma_uint64 w = atomic_load_u64(&g_ring_written);
+        const ma_uint64 r = atomic_load_u64(&g_ring_read);
         if (w - r >= (ma_uint64)g_chunk_samples)
             break;
         EnterCriticalSection(&g_cs);
@@ -232,10 +239,10 @@ int capture_read_chunk(int16_t *out) {
         if (!started) return 0;
     }
 
-    const ma_uint64 r = atomic_u64_load(&g_ring_read);
+    const ma_uint64 r = atomic_load_u64(&g_ring_read);
     for (int i = 0; i < g_chunk_samples; i++)
         out[i] = g_ring[(r + i) & RING_MASK];
-    atomic_u64_store(&g_ring_read, r + (ma_uint64)g_chunk_samples);
+    atomic_store_u64(&g_ring_read, r + (ma_uint64)g_chunk_samples);
     return 1;
 }
 

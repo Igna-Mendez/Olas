@@ -1,28 +1,46 @@
 @echo off
-rem Fetch Moonshine C++ model directories used by OLAS.
-rem Each model is a folder containing encoder/decoder ONNX + config.
-rem Adjust MOONSHINE_BASE if the release URL changes.
+rem Fetch Moonshine C++ model files used by OLAS.
+rem Models are individual .ort/.bin files on download.moonshine.ai, not archives.
+rem Layout produced:
+rem   models\base-en\encoder_model.ort
+rem   models\base-en\decoder_model_merged.ort
+rem   models\base-en\tokenizer.bin
+rem   models\base-es\... (same)
 
-setlocal
+setlocal EnableDelayedExpansion
 set "HERE=%~dp0"
 set "MODELS=%HERE%..\models"
 if not exist "%MODELS%" mkdir "%MODELS%"
 
-set "MOONSHINE_BASE=https://github.com/moonshine-ai/moonshine/releases/latest/download"
+set "CDN=https://download.moonshine.ai"
 
-echo Downloading base-en ...
-powershell -NoProfile -Command ^
-  "iwr -UseBasicParsing -OutFile '%MODELS%\base-en.zip' '%MOONSHINE_BASE%/base-en.zip'"
-powershell -NoProfile -Command ^
-  "Expand-Archive -Force '%MODELS%\base-en.zip' '%MODELS%'"
+rem ---- languages to fetch (space-separated) ----
+set "LANGS=en es"
 
-echo Downloading base-es ...
-powershell -NoProfile -Command ^
-  "iwr -UseBasicParsing -OutFile '%MODELS%\base-es.zip' '%MOONSHINE_BASE%/base-es.zip'"
-powershell -NoProfile -Command ^
-  "Expand-Archive -Force '%MODELS%\base-es.zip' '%MODELS%'"
+for %%L in (%LANGS%) do (
+    set "LANG=%%L"
+    set "DEST=%MODELS%\base-%%L"
+    set "URL=%CDN%/model/base-%%L/quantized/base-%%L"
+    if not exist "!DEST!" mkdir "!DEST!"
+
+    echo.
+    echo === base-%%L ===
+    for %%F in (encoder_model.ort decoder_model_merged.ort tokenizer.bin) do (
+        if exist "!DEST!\%%F" (
+            echo   [skip] %%F already present
+        ) else (
+            echo   [get ] %%F
+            powershell -NoProfile -Command ^
+              "$ProgressPreference='SilentlyContinue';" ^
+              "Invoke-WebRequest -UseBasicParsing -Uri '!URL!/%%F' -OutFile '!DEST!\%%F'"
+            if errorlevel 1 (
+                echo   [FAIL] %%F  ^(see message above^)
+            )
+        )
+    )
+)
 
 echo.
 echo Done. Models are in %MODELS%.
-echo Run olas_win.exe with -m "%MODELS%\base-en,%MODELS%\base-es"
+echo Run:  olas_win.exe -l en,es -m "%MODELS%\base-en,%MODELS%\base-es"
 endlocal

@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <avrt.h>
 
 #include "moonshine_engine.h"
 #include "transcript_sink.h"
@@ -56,18 +57,27 @@ struct CaptureArgs {
 };
 
 static void capture_loop(CaptureArgs *a) {
+    // Register with the Multimedia Class Scheduler Service. MMCSS gives the
+    // audio thread a guaranteed slice and ducking priority over normal work,
+    // which is enough to keep the capture path glitch-free without needing
+    // TIME_CRITICAL (which can starve the rest of the system).
+    DWORD mmcss_index = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcss_index);
+    if (!mmcss) {
+        win32_ui_post_status("warning: MMCSS registration failed; audio may glitch under load");
+    }
+
     std::vector<int16_t> pcm((size_t)a->chunk_samples);
     while (g_running.load()) {
         if (!capture_read_chunk(pcm.data())) {
-            // capture_read_chunk() returns 0 whenever capture is transiently
-            // stopped (e.g. device switch).  Only exit if we're actually
-            // shutting down.
             if (!g_running.load()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
         a->engine->feed(pcm);
     }
+
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
 }
 
 // ---------------- CLI helpers ----------------

@@ -1,3 +1,28 @@
+/* Windows.h must come first so Moonshine's own headers see a clean macro
+ * namespace. The re-undefs immediately after the include remove the macros
+ * that collide with identifiers used by moonshine-cpp.h (ERROR, DELETE, IN,
+ * OUT, small, interface, etc.). This is the same guard used by
+ * moonshine_engine.h, applied here because this TU now calls
+ * SetThreadPriority / GetCurrentThread directly. */
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  undef ERROR
+#  undef DELETE
+#  undef IN
+#  undef OUT
+#  undef OPTIONAL
+#  undef small
+#  undef near
+#  undef far
+#  undef interface
+#  undef GetObject
+#  undef CreateFile
+#  undef LoadImage
+#endif
+
 #include "moonshine_engine.h"
 
 #include <algorithm>
@@ -425,7 +450,16 @@ private:
     class InferenceThread {
     public:
         InferenceThread(moonshine::Transcriber *t, PrintListener *l)
-            : t_(t), l_(l) { th_ = std::thread([this] { run(); }); }
+        : t_(t), l_(l) {
+            th_ = std::thread([this] {
+                #ifdef _WIN32
+                SetThreadPriority(GetCurrentThread(),
+                                  THREAD_PRIORITY_BELOW_NORMAL);
+                #endif
+                run();
+            });
+        }
+
         ~InferenceThread() {
             { std::lock_guard<std::mutex> lk(m_); closing_ = true; cv_.notify_all(); }
             if (th_.joinable()) th_.join();

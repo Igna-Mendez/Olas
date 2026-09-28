@@ -84,6 +84,43 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Build provenance + update-check metadata
+# ---------------------------------------------------------------------------
+find_package(Git QUIET)
+
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE OLAS_GIT_SHA
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE OLAS_GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+
+if(NOT OLAS_GIT_SHA)
+    set(OLAS_GIT_SHA "unknown")
+endif()
+if(NOT OLAS_GIT_BRANCH)
+    set(OLAS_GIT_BRANCH "unknown")
+endif()
+
+string(TIMESTAMP OLAS_BUILD_DATE "%Y-%m-%d %H:%M:%S UTC" UTC)
+
+# GitHub repo to check for updates. "owner/name" form.
+# Leave EMPTY to disable the update check entirely.
+# Change this to your actual public repo before shipping.
+set(OLAS_UPDATE_REPO "Igna-Mendez/Olas" CACHE STRING
+    "GitHub repo (owner/name) for update checks; empty to disable")
+
+# ---------------------------------------------------------------------------
 # OLAS executable
 # ---------------------------------------------------------------------------
 add_executable(olas_win WIN32
@@ -92,6 +129,7 @@ add_executable(olas_win WIN32
     src/win32_ui.cpp
     src/moonshine_engine.cpp
     src/miniaudio_impl.c
+    src/update_check.cpp
 )
 
 target_include_directories(olas_win PRIVATE
@@ -110,6 +148,10 @@ target_compile_definitions(olas_win PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS
+    OLAS_GIT_SHA="${OLAS_GIT_SHA}"
+    OLAS_GIT_BRANCH="${OLAS_GIT_BRANCH}"
+    OLAS_BUILD_DATE="${OLAS_BUILD_DATE}"
+    OLAS_UPDATE_REPO="${OLAS_UPDATE_REPO}"
 )
 
 target_link_libraries(olas_win PRIVATE
@@ -122,6 +164,9 @@ target_link_libraries(olas_win PRIVATE
     advapi32
     shell32
     winmm
+    avrt
+    dwmapi
+    winhttp
 )
 
 # Link Moonshine (pulls in ONNX Runtime in bundled mode).
@@ -143,6 +188,7 @@ endif()
 # (MinGW ships a WinMain shim that calls main, so it's already fine there.)
 if(MSVC)
     set_target_properties(olas_win PROPERTIES LINK_FLAGS "/ENTRY:mainCRTStartup")
+    target_compile_options(olas_win PRIVATE "/utf-8")
 endif()
 
 if(MINGW)
@@ -191,3 +237,13 @@ add_custom_target(dist
     COMMENT "Packaging OLAS-win64 distribution folder"
     VERBATIM
 )
+# Copy the correct ONNX Runtime DLL next to olas_win.exe on Windows
+if(WIN32)
+    add_custom_command(TARGET olas_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:moonshine>/onnxruntime.dll"
+            "$<TARGET_FILE_DIR:olas_win>/onnxruntime.dll"
+        COMMENT "Copying onnxruntime.dll next to olas_win.exe"
+        VERBATIM
+    )
+endif()
