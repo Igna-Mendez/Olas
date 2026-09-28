@@ -716,8 +716,11 @@ static void pane_detach(Pane *p) {
     if (g_collapsed_pane == p) pane_set_collapsed(p, false);
 
     ShowWindow(p->container, SW_HIDE);
+    // WS_EX_APPWINDOW gives the float window a taskbar button, which is what
+    // makes minimize/restore actually work — a WS_EX_TOOLWINDOW window
+    // minimizes into nothing and can't be brought back.
     HWND w = CreateWindowExW(
-        WS_EX_TOOLWINDOW, L"OLASFloat", L"OLAS",
+        WS_EX_APPWINDOW, L"OLASFloat", L"OLAS",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, D(640), D(420),
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -772,18 +775,65 @@ static void pane_reattach(Pane *p) {
 }
 
 // ---------------- respawn ----------------
-
 static bool pane_alive(Pane *p) {
     return p && p->container && IsWindow(p->container) &&
-           p->edit && IsWindow(p->edit);
+    p->edit && IsWindow(p->edit);
 }
 
+// Restore handler. Called from the toolbar button. Should leave the pane in
+// a fully functional state regardless of what happened to its HWNDs:
+//   * float_window stale or destroyed    -> clear, reattach into main
+//   * container alive, children destroyed -> destroy container, rebuild
+//   * container destroyed                 -> rebuild from scratch
+//   * everything alive                    -> no-op
 static void pane_respawn(Pane *p) {
-    if (!p || pane_alive(p)) return;
+    if (!p) return;
+
+    // 1. A float window handle that's no longer valid is a stale pointer.
+    //    Clear it and the associated global, otherwise the "is this pane
+    //    docked?" logic in main_layout will keep skipping it.
+    if (p->float_window && !IsWindow(p->float_window)) {
+        p->float_window = nullptr;
+    }
+    if (g_floated_pane == p && !p->float_window) {
+        g_floated_pane = nullptr;
+    }
+
+    // 2. If the pane's own HWNDs are still good, there's nothing to do.
+    if (pane_alive(p)) {
+        // ...but do make sure it's a child of the main window, in case a
+        // float window was destroyed out from under us and the container
+        // ended up orphaned.
+        if (GetParent(p->container) != g_main_window) {
+            SetParent(p->container, g_main_window);
+            ShowWindow(p->container, SW_SHOWNA);
+            main_layout();
+            raise_toolbar_overlay();
+        }
+        return;
+    }
+
+    // 3. Container survives but its children are gone. Destroy and rebuild.
+    if (p->container && IsWindow(p->container)) {
+        DestroyWindow(p->container);
+    }
+
+    // 4. Wipe every HWND and rebuild from scratch. The transcript log
+    //    (p->log) is preserved, so pane_rerender repopulates the buffer.
+    p->container    = nullptr;
+    p->label        = nullptr;
+    p->edit         = nullptr;
+    p->toggle_btn   = nullptr;
+    p->collapse_btn = nullptr;
+    p->detach_btn   = nullptr;
     p->float_window = nullptr;
+
     if (g_floated_pane   == p) g_floated_pane   = nullptr;
     if (g_collapsed_pane == p) g_collapsed_pane = nullptr;
-    p->collapsed = false;
+    p->collapsed     = false;
+    p->partial_start = 0;
+    p->last_partial.clear();
+
     pane_create_controls(p, GetModuleHandleW(nullptr));
     pane_rerender(p);
     main_layout();
@@ -1247,14 +1297,6 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_STATUS: {
             wchar_t *w = (wchar_t *)lp;
             if (w) { set_status_w(w); free(w); }
-            return 0;
-        }
-
-        case WM_GETMINMAXINFO: {
-            MINMAXINFO *m = (MINMAXINFO *)lp;
-            // Big enough for two panes + toolbar + buttons without clipping.
-            m->ptMinTrackSize.x = D(900);
-            m->ptMinTrackSize.y = D(500);
             return 0;
         }
 
